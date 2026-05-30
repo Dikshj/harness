@@ -1,0 +1,485 @@
+import io
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from rlm_harness.model_client import LMClient
+from rlm_harness.sandbox import DockerREPL, RLMSubcallConfig, SandboxConfig, SandboxError
+from rlm_harness.sandbox import tools as sandbox_tools
+from rlm_harness.types import Completion
+
+IMAGE = "rlm-harness-sandbox:test"
+
+
+def docker_available():
+    try:
+        completed = subprocess.run(
+            ["docker", "info", "--format", "{{.ServerVersion}}"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        return False
+    return completed.returncode == 0
+
+
+class DockerREPLConfigTests(unittest.TestCase):
+    def test_start_retries_after_docker_desktop_missing_bind_source(self):
+        class ExitedProcess:
+            stderr = io.StringIO(
+                'docker: Error response from daemon: invalid mount config for type "bind": '
+                "bind source path does not exist: /host_mnt/tmp/workspace\n"
+            )
+
+            def poll(self):
+                return 1
+
+        class RunningProcess:
+            stdin = None
+            stdout = None
+            stderr = io.StringIO("")
+
+            def poll(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "subprocess.Popen", side_effect=[ExitedProcess(), RunningProcess()]
+        ) as popen, patch(
+            "subprocess.run", return_value=subprocess.CompletedProcess([], 0, "", "")
+        ) as run:
+            repl = DockerREPL(SandboxConfig(workspace=Path(temp_dir)))
+
+            repl.start()
+
+        self.assertEqual(popen.call_count, 2)
+        self.assertEqual(run.call_count, 1)
+        self.assertTrue(
+            any(str(Path(temp_dir).resolve().parent) in arg for arg in run.call_args.args[0])
+        )
+
+    def test_start_reports_missing_docker_cli_cleanly(self):
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "subprocess.Popen", side_effect=FileNotFoundError("docker")
+        ):
+            repl = DockerREPL(SandboxConfig(workspace=Path(temp_dir)))
+
+            with self.assertRaisesRegex(
+                SandboxError,
+                "docker CLI not found; install Docker or run with --no-sandbox",
+            ):
+                repl.start()
+
+    def test_build_image_reports_missing_docker_cli_cleanly(self):
+        with patch("subprocess.run", side_effect=FileNotFoundError("docker")):
+            with self.assertRaisesRegex(
+                SandboxError,
+                "docker CLI not found; install Docker or run with --no-sandbox",
+            ):
+                DockerREPL.build_image()
+
+    def test_subcall_model_override_is_temporary(self):
+        class CapturingClient(LMClient):
+            def __init__(self):
+                super().__init__(provider="stub", model="base-model")
+                self.seen_models = []
+
+            def complete(self, messages, max_tokens=512, temperature=0.2):
+                self.seen_models.append(self.model)
+                return Completion(
+                    content="ok",
+                    model=self.model,
+                    provider="test",
+                    latency_ms=0,
+                )
+
+        client = CapturingClient()
+        repl = DockerREPL(completion_client=client)
+
+        content = repl._complete_for_sandbox(
+            {
+                "query": "answer",
+                "context": "ctx",
+                "model": "special-model",
+                "max_tokens": 8,
+            },
+            recursive=False,
+        )
+
+        self.assertEqual(content, "ok")
+        self.assertEqual(client.seen_models, ["special-model"])
+        self.assertEqual(client.model, "base-model")
+
+    def test_file_slice_and_chunk_tools_page_large_context(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir).resolve()
+            target = workspace / "large.txt"
+            target.write_text("0123456789" * 100, encoding="utf-8")
+            old_workspace = sandbox_tools.WORKSPACE
+            sandbox_tools.WORKSPACE = workspace
+            try:
+                slice_payload = sandbox_tools.read_file_slice(
+                    "large.txt",
+                    start=10,
+                    max_bytes=15,
+                )
+                chunks = sandbox_tools.chunk_file(
+                    "large.txt",
+                    chunk_chars=12,
+                    max_chunks=3,
+                )
+            finally:
+                sandbox_tools.WORKSPACE = old_workspace
+
+        self.assertEqual(slice_payload["content"], "012345678901234")
+        self.assertEqual(slice_payload["start"], 10)
+        self.assertTrue(slice_payload["truncated"])
+        self.assertEqual([chunk["index"] for chunk in chunks], [0, 1, 2])
+        self.assertEqual(chunks[0]["content"], "012345678901")
+
+    def test_proposal_tools_queue_diff_and_apply_after_approval(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir).resolve()
+            (workspace / "app.py").write_text("print('old')\n", encoding="utf-8")
+            old_workspace = sandbox_tools.WORKSPACE
+            sandbox_tools.WORKSPACE = workspace
+            try:
+                sandbox_tools.clear_pending_changes()
+                proposal = sandbox_tools.propose_file_change(
+                    "app.py",
+                    "print('new')\n",
+                    reason="example",
+                )
+                pending = sandbox_tools.list_pending_changes()
+                result = sandbox_tools.apply_pending_change(proposal["id"])
+                written = (workspace / "app.py").read_text(encoding="utf-8")
+            finally:
+                sandbox_tools.clear_pending_changes()
+                sandbox_tools.WORKSPACE = old_workspace
+
+        self.assertTrue(proposal["approval_required"])
+        self.assertIn("-print('old')", proposal["diff"])
+        self.assertEqual(pending[0]["id"], proposal["id"])
+        self.assertIn("wrote app.py", result)
+        self.assertEqual(written, "print('new')\n")
+
+    def test_run_shell_blocks_destructive_commands_without_approval(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            old_workspace = sandbox_tools.WORKSPACE
+            sandbox_tools.WORKSPACE = Path(temp_dir).resolve()
+            try:
+                with self.assertRaisesRegex(sandbox_tools.ToolError, "destructive"):
+                    sandbox_tools.run_shell("rm -rf .")
+            finally:
+                sandbox_tools.WORKSPACE = old_workspace
+
+    def test_project_summary_uses_friendly_brief_and_skips_badges(self):
+        summary = sandbox_tools.render_project_overview_summary(
+            {
+                "files": [
+                    "README.md",
+                    "Cargo.toml",
+                    "crates/sansara-cli/src/main.rs",
+                    "crates/sansara-cli/tests/help_integration.rs",
+                ],
+                "documents": [
+                    {
+                        "path": "README.md",
+                        "content": (
+                            "[![skills.sh](https://skills.sh/b/a3fckx/sansara)]"
+                            "(https://skills.sh/b/a3fckx/sansara)\n\n"
+                            "# Sansara\n\n"
+                            "Vault-native agent OS for coding assistants.\n"
+                        ),
+                    },
+                    {
+                        "path": "Cargo.toml",
+                        "content": (
+                            "[package]\n"
+                            "name = \"sansara\"\n"
+                            "description = \"Vault-native agent OS.\"\n"
+                        ),
+                    },
+                ],
+                "git_status": "M crates/sansara-cli/src/main.rs\n",
+                "git_log": "3236378 chore: simplify routing\n",
+            }
+        )
+
+        self.assertIn("Project Summary", summary)
+        self.assertIn("sansara is vault-native agent OS.", summary)
+        self.assertIn("It appears to use Rust.", summary)
+        self.assertIn("What I would do next", summary)
+        self.assertIn("Verification I would run", summary)
+        self.assertIn("cargo test", summary)
+        self.assertNotIn("skills.sh", summary)
+        self.assertNotIn("Files inspected", summary)
+        self.assertNotIn("Working tree:", summary)
+
+    def test_project_summary_uses_readme_title_for_cargo_workspace(self):
+        summary = sandbox_tools.render_project_overview_summary(
+            {
+                "files": [
+                    "README.md",
+                    "Cargo.toml",
+                    "crates/sansara-cli/src/main.rs",
+                ],
+                "documents": [
+                    {
+                        "path": "README.md",
+                        "content": (
+                            "# Sansara\n\n"
+                            "[![skills.sh](https://skills.sh/b/a3fckx/sansara)]"
+                            "(https://skills.sh/b/a3fckx/sansara)\n\n"
+                            "Vault-native autonomous agent OS: a **flat wiki** "
+                            "Obsidian vault is the world model. **Canonical docs.**\n"
+                        ),
+                    },
+                    {
+                        "path": "Cargo.toml",
+                        "content": (
+                            "[workspace]\n"
+                            'members = ["crates/sansara-cli"]\n'
+                            "resolver = \"2\"\n\n"
+                            "[workspace.package]\n"
+                            "version = \"0.2.0\"\n"
+                            "edition = \"2021\"\n"
+                        ),
+                    },
+                ],
+                "git_status": "",
+                "git_log": "",
+            }
+        )
+
+        self.assertIn("Sansara is vault-native autonomous agent OS", summary)
+        self.assertIn("It appears to use Rust.", summary)
+        self.assertIn("cargo test", summary)
+        self.assertNotIn("**", summary)
+        self.assertNotIn("skills.sh", summary)
+
+
+@unittest.skipUnless(docker_available(), "Docker daemon is not available")
+class DockerREPLTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        DockerREPL.build_image(image=IMAGE)
+
+    def sandbox(self, workspace):
+        return DockerREPL(
+            SandboxConfig(
+                image=IMAGE,
+                workspace=Path(workspace),
+                default_timeout_s=2,
+                start_timeout_s=10,
+            )
+        )
+
+    def rlm_sandbox(self, workspace, subcall_config=None):
+        return DockerREPL(
+            SandboxConfig(
+                image=IMAGE,
+                workspace=Path(workspace),
+                default_timeout_s=2,
+                start_timeout_s=10,
+            ),
+            completion_client=LMClient(provider="stub"),
+            subcall_config=subcall_config,
+        )
+
+    def test_executes_python_and_returns_stdout(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.sandbox(temp_dir) as repl:
+                result = repl.execute("print(2 + 2)")
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.stdout.strip(), "4")
+        self.assertEqual(result.stderr, "")
+
+    def test_namespace_persists_across_exec_calls(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.sandbox(temp_dir) as repl:
+                first = repl.execute("counter = 41")
+                second = repl.execute("counter += 1\nprint(counter)")
+
+        self.assertTrue(first.ok)
+        self.assertTrue(second.ok)
+        self.assertEqual(second.stdout.strip(), "42")
+
+    def test_captures_stderr_and_exception_status(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.sandbox(temp_dir) as repl:
+                result = repl.execute(
+                    "import sys\n"
+                    "print('before')\n"
+                    "print('warn', file=sys.stderr)\n"
+                    "raise ValueError('bad')"
+                )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, "error")
+        self.assertIn("before", result.stdout)
+        self.assertIn("warn", result.stderr)
+        self.assertIn("ValueError: bad", result.stderr)
+
+    def test_timeout_marks_result_without_killing_session(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.sandbox(temp_dir) as repl:
+                timeout = repl.execute("while True:\n    pass", timeout_s=1)
+                after = repl.execute("print('alive')", timeout_s=1)
+
+        self.assertFalse(timeout.ok)
+        self.assertTrue(timeout.timed_out)
+        self.assertEqual(timeout.status, "timeout")
+        self.assertTrue(after.ok)
+        self.assertEqual(after.stdout.strip(), "alive")
+
+    def test_workspace_mount_allows_scoped_file_io(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            (workspace / "input.txt").write_text("hello", encoding="utf-8")
+            with self.sandbox(workspace) as repl:
+                result = repl.execute(
+                    "from pathlib import Path\n"
+                    "text = Path('/workspace/input.txt').read_text()\n"
+                    "Path('/workspace/output.txt').write_text(text + ' sandbox')\n"
+                    "print(Path('/workspace/output.txt').read_text())"
+                )
+
+            output = (workspace / "output.txt").read_text(encoding="utf-8")
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.stdout.strip(), "hello sandbox")
+        self.assertEqual(output, "hello sandbox")
+
+    def test_coding_tools_are_available_and_workspace_scoped(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            with self.sandbox(workspace) as repl:
+                result = repl.execute(
+                    "print(','.join(tool_names()))\n"
+                    "write_file('src/example.py', 'def add(a, b):\\n    return a + b\\n')\n"
+                    "print(list_files('src'))\n"
+                    "print(read_file('src/example.py'))\n"
+                    "print(search_code('def add', 'src'), end='')\n"
+                    "shell = run_shell('python -c \"print(6 * 7)\"')\n"
+                    "print(shell['stdout'], end='')\n"
+                    "run_shell('git init >/dev/null')\n"
+                    "print(git_status(), end='')"
+                )
+
+        self.assertTrue(result.ok)
+        self.assertIn("read_file", result.stdout)
+        self.assertIn("project_overview", result.stdout)
+        self.assertIn("write_file", result.stdout)
+        self.assertIn("def add(a, b):", result.stdout)
+        self.assertIn("42", result.stdout)
+        self.assertIn("src/example.py", result.stdout)
+
+    def test_project_overview_handles_missing_readme(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            (workspace / "pyproject.toml").write_text(
+                "[project]\nname = 'sample-project'\n",
+                encoding="utf-8",
+            )
+            (workspace / "app.py").write_text("print('hello')\n", encoding="utf-8")
+            with self.sandbox(workspace) as repl:
+                result = repl.execute(
+                    "overview = project_overview()\n"
+                    "print('README.md' in overview['files'])\n"
+                    "print([doc['path'] for doc in overview['documents']])"
+                )
+
+        self.assertTrue(result.ok)
+        self.assertIn("False", result.stdout)
+        self.assertIn("pyproject.toml", result.stdout)
+
+    def test_read_first_existing_supports_readme_variants(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            (workspace / "readme.md").write_text("lowercase readme", encoding="utf-8")
+            with self.sandbox(workspace) as repl:
+                result = repl.execute(
+                    "doc = read_first_existing(['README.md', 'readme.md'])\n"
+                    "print(doc['path'])\n"
+                    "print(doc['content'])"
+                )
+
+        self.assertTrue(result.ok)
+        self.assertIn("README", result.stdout)
+        self.assertIn("lowercase readme", result.stdout)
+
+    def test_coding_tools_reject_file_path_escape(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.sandbox(temp_dir) as repl:
+                result = repl.execute("print(read_file('../outside.txt'))")
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, "tool_error")
+        self.assertIn("path escapes workspace", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_coding_tools_report_invalid_path_without_traceback(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.sandbox(temp_dir) as repl:
+                result = repl.execute("print(read_file(None))")
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, "tool_error")
+        self.assertIn("path must be a non-empty string", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_container_cleanup_on_exit(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repl = self.sandbox(temp_dir)
+            name = repl.container_name
+            with repl:
+                result = repl.execute("print('cleanup')")
+
+            completed = subprocess.run(
+                ["docker", "ps", "-a", "--filter", f"name={name}", "--format", "{{.Names}}"],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(completed.stdout.strip(), "")
+
+    def test_rlm_completion_round_trip_from_sandbox_to_host_model(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.rlm_sandbox(temp_dir) as repl:
+                result = repl.execute(
+                    "answer = rlm.completion('summarize this', 'context text')\nprint(answer)"
+                )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.subcalls, 1)
+        self.assertGreater(result.tokens_used, 0)
+        self.assertIn("Stub response for task:", result.stdout)
+        self.assertIn("Query:\nsummarize this", result.stdout)
+
+    def test_rlm_completion_depth_limit_fails_cleanly(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.rlm_sandbox(temp_dir, RLMSubcallConfig(max_depth=0)) as repl:
+                result = repl.execute("print(rlm.completion('too deep', 'context', depth_hint=1))")
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, "error")
+        self.assertIn("exceeds max depth", result.stderr)
+
+    def test_rlm_completion_requires_host_client(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.sandbox(temp_dir) as repl:
+                result = repl.execute("print(rlm.completion('query', 'context'))")
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, "error")
+        self.assertIn("not enabled", result.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,1 +1,0 @@
-from harness.api.main import app
