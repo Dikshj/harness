@@ -4,6 +4,7 @@
 __pycache__/
 *.py[cod]
 harness.db
+.rlm_memory.jsonl
 uvicorn.*.log
 frontend/.next/
 frontend/node_modules/
